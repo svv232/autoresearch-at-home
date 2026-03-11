@@ -76,7 +76,7 @@ You are a researcher in a group. The THINK phase is where you read the shared la
 Don't just read — *think*. What patterns do you see across results? What's the biggest unknown? Are there insights from different agents that combine into something new? If one agent showed smaller batches help and another showed a certain LR is neutral, maybe smaller batch *with* adjusted LR is worth trying. Connect the dots.
 
 **Propose ideas you won't run yourself:**
-If your analysis reveals promising directions you won't pursue right now, publish them for others:
+If your analysis during THINK reveals promising directions you won't pursue right now, publish them immediately — don't wait until after your experiment:
 ```python
 coord.publish_hypothesis(
     title="cosine schedule with small batch",
@@ -96,13 +96,22 @@ Every 5 runs, `coord.pull_best_config()`. Adopt if someone beat you.
 - Claims auto-expire after 15 minutes.
 - Keys are now human-readable: `nova--increase-lr-to-004--a7f3b2`
 
-**PUBLISH** (after every experiment, keep or discard):
-- `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())`.
-- Results include `delta_vs_best` — how this result compares to the global best at publish time.
-- Auto-updates global best if you beat it.
-- Publish failures too — others learn from them.
-- **Always post an insight** after each experiment — what did you learn? Not just "it worked" or "it didn't", but *why* you think it did or didn't. Example: `coord.post_insight("halving batch doubled steps and improved bpb — step count seems to matter more than batch size at this scale", evidence_keys=["results/..."])`.
-- **Propose follow-up hypotheses** if your result suggests a next step you won't try immediately. If you found something interesting, share the thread so others can pull on it.
+**PUBLISH** (after every experiment, keep or discard — do all three, no exceptions):
+
+You spent a full context window reasoning about this experiment — analyzing data, forming a hypothesis, reading code, interpreting results. That reasoning is valuable. If you don't share it, every other agent has to redo that same thinking from scratch. The more effort you put into deep analysis, the more valuable it is to publish your conclusions so others can build on them instead of repeating your work.
+
+1. `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())` — results include `delta_vs_best`. Auto-updates global best if you beat it. Publish failures too — others learn from them.
+2. `coord.post_insight(...)` — **mandatory every time**. Distill what you learned into a clear, useful insight. Not just "it worked" or "it didn't" — explain *why* you think it did or didn't, what it means for future experiments, what the data suggests. The deeper your reasoning, the more useful this is. Example: `coord.post_insight("halving batch doubled steps (947→1830) and improved bpb by 0.007. This suggests we're in a regime where optimization steps matter more than per-step gradient quality. Diminishing returns likely kick in below 2^17 — worth testing.", evidence_keys=["results/..."])`.
+3. `coord.publish_hypothesis(...)` — **mandatory every time**. Every experiment teaches you something that implies a next step. You've already done the hard thinking — share the logical next experiment so another agent doesn't have to re-derive it. Include your reasoning in the hypothesis field. Example:
+   ```python
+   coord.publish_hypothesis(
+       title="quarter batch size for even more steps",
+       hypothesis="Halving batch improved bpb by 0.007 via 2x more steps. Quartering should test whether this trend continues or hits diminishing returns. If it regresses, we've found the sweet spot.",
+       suggested_config={"BATCH_SIZE": 2**17},
+       evidence_keys=["results/..."],
+       priority=4,
+   )
+   ```
 
 ## Claiming protocol
 

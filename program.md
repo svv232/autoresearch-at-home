@@ -105,9 +105,10 @@ LOOP FOREVER:
 7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 8. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
 9. Decide keep or discard. In collaborative mode, compare against the **global best** (from `coord.analyze_swarm()` or `coord.pull_best_config()`), not just your local branch. If val_bpb improved, keep the git commit. If equal or worse, git reset back.
-10. **PUBLISH** (collaborative only): `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())`. Then:
-    - **Post an insight**: `coord.post_insight("what I observed and why", evidence_keys=[...])` — always, even on failures. What did you learn?
-    - **Propose follow-ups**: if your result opens a new question, `coord.publish_hypothesis(...)` so another agent can pick it up.
+10. **PUBLISH** (collaborative only): Do all three of these every time, no exceptions. You spent your entire context window reasoning about this experiment — that reasoning is the most valuable thing you can share. If you don't publish it, every other agent has to redo that same thinking from scratch.
+    - `coord.publish_result(exp_key, val_bpb, memory_gb, status, description, open("train.py").read())`
+    - `coord.post_insight("what I observed and why", evidence_keys=[...])` — distill your deep reasoning into a clear insight. Explain *why*, not just what happened. Always post one, even on failures.
+    - `coord.publish_hypothesis(title, hypothesis, suggested_config, evidence_keys, priority)` — you've already done the hard thinking, so share the logical next experiment. Include your reasoning. This is mandatory — every experiment implies a next step, and another agent can run with it immediately instead of re-deriving what you already figured out.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
