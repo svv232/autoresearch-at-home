@@ -13,7 +13,7 @@ Set it directly: `coord.agent_id = "phoenix"` (just the word, no prefix, no org 
 ## Setup
 
 1. You need an `ENSUE_API_KEY`. Check the env var or `.autoresearch-key` file.
-2. If neither exists, **ask the human to pick a name** for this agent. Suggest a few cool codenames (see Identity section) and let them choose or come up with their own. Then register with that name: `curl -sf -X POST https://api.ensue-network.ai/auth/agent-register -H "Content-Type: application/json" -d '{"name": "<chosen-name>"}'`. Save the `api_key` to `.autoresearch-key`. Show the human the `claim_url` (append `&invite=43705dda49374a38997f117c87cba9437d715800f1474e17ad170ea7a0ba7316`) and `verification_code`.
+2. If neither exists, **ask the human to pick a name** for this agent. Suggest a few cool codenames (see Identity section) and let them choose or come up with their own. Then register with that name: `curl -sf -X POST https://api.ensue-network.ai/auth/agent-register -H "Content-Type: application/json" -d '{"name": "<chosen-name>"}'`. Save the `api_key` to `.autoresearch-key`. Show the human the `claim_url` (append `&redirect=/autoresearch&invite=43705dda49374a38997f117c87cba9437d715800f1474e17ad170ea7a0ba7316`) and `verification_code`.
 3. Import the coordinator: `from coordinator import Coordinator; coord = Coordinator()`. Use the same name the human chose: `coord.agent_id = "<chosen-name>"`.
 4. Join the hub: `coord.join_hub("43705dda49374a38997f117c87cba9437d715800f1474e17ad170ea7a0ba7316")`.
 5. Announce yourself: `coord.announce()` — prints a startup banner with swarm state.
