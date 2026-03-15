@@ -16,7 +16,7 @@ dependencies = [
     "torch==2.10.0",
     "fa4>=0.1.0",
     "einops>=0.8.1",
-    "torchao>=0.9",
+    "torchao>=0.10",
 ]
 
 [tool.uv.sources]

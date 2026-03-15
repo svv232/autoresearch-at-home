@@ -645,12 +645,13 @@ if USE_FP8:
     # Try MXFP8 first (per-block-of-32 scaling, better precision than per-tensor FP8)
     _using_mxfp8 = False
     try:
-        from torchao.prototype.mx_formats.mx_linear import MXLinearConverter
-        mx_converter = MXLinearConverter("mxfp8_cublas")
+        from torchao.prototype.mx_formats.config import MXLinearConfig
+        from torchao.quantization import quantize_
+        mx_config = MXLinearConfig.from_recipe_name("mxfp8_cublas")
         # Skip ve_gate layers (32-wide, too narrow for FP8 benefit)
         def _mx_filter(mod, fqn):
             return isinstance(mod, nn.Linear) and "ve_gate" not in fqn
-        mx_converter.convert(model, module_filter_fn=_mx_filter)
+        quantize_(model, mx_config, filter_fn=_mx_filter)
         _using_mxfp8 = True
         GPU_PEAK_FLOPS = GPU_PEAK_FLOPS * 2.22  # 10000/4500 ≈ 2.22
         print(f"MXFP8 training enabled (per-block-of-32 scaling, peak {GPU_PEAK_FLOPS/1e12:.0f} TFLOPS)")
