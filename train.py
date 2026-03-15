@@ -8,6 +8,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"      # persistent compile cache across runs
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"         # serialize kernel launches for better overlap
 
 import gc
 import math
@@ -179,13 +180,15 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
+        # Value embeddings — stored as ModuleDict for parameter tracking,
+        # but accessed via _ve_list (plain list) to avoid dict lookups that cause graph breaks
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.vocab_size, kv_dim)
             for i in range(config.n_layer) if has_ve(i, config.n_layer)
         })
+        self._ve_list = [self.value_embeds.get(str(i)) for i in range(config.n_layer)]
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -288,8 +291,11 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
+        # Verify all params are covered (use >= to allow FP8 scale params in transformer.h)
+        grouped_count = (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+        total_count = len(list(self.parameters()))
+        assert grouped_count >= total_count, f"Param group mismatch: {grouped_count} grouped vs {total_count} total"
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
@@ -316,31 +322,50 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        # Build block masks once on first forward pass (model starts on meta device)
-        if USE_FLEX_ATTENTION and self._flex_block_masks is None:
-            unique_windows = set(self.window_sizes)
-            cache = {ws: _build_flex_block_mask(ws, B, self.config.n_head, T) for ws in unique_windows}
-            self._flex_block_masks = [cache[ws] for ws in self.window_sizes]
-
+        # Block masks are built eagerly before torch.compile (no lazy init = no graph break)
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self._ve_list[i](idx) if self._ve_list[i] is not None else None
             block_mask = self._flex_block_masks[i] if USE_FLEX_ATTENTION else None
             x = block(x, ve, cos_sin, self.window_sizes[i], block_mask)
         x = norm(x)
 
         softcap = 15
+
+        if targets is not None:
+            # Chunked cross-entropy: avoid materializing full (B*T, V) logit tensor
+            # Saves ~8 GB of FP32 memory traffic per micro-step at B=128, T=2048, V=8192
+            x_flat = x.view(-1, x.size(-1))       # (B*T, d)
+            targets_flat = targets.view(-1)         # (B*T,)
+            chunk_size = 4096  # tokens per chunk — keeps peak logit buffer at ~134 MB
+
+            if reduction == 'none':
+                # Eval path: evaluate_bpb() needs per-token losses
+                losses = []
+                for i in range(0, x_flat.size(0), chunk_size):
+                    logits_chunk = self.lm_head(x_flat[i:i+chunk_size]).float()
+                    logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    losses.append(F.cross_entropy(logits_chunk, targets_flat[i:i+chunk_size],
+                                                  ignore_index=-1, reduction='none'))
+                return torch.cat(losses)
+            else:
+                # Training path: accumulate sum, divide at the end
+                total_loss = torch.tensor(0.0, device=x.device)
+                n_tokens = targets_flat.ne(-1).sum()
+                for i in range(0, x_flat.size(0), chunk_size):
+                    logits_chunk = self.lm_head(x_flat[i:i+chunk_size]).float()
+                    logits_chunk = softcap * torch.tanh(logits_chunk / softcap)
+                    total_loss = total_loss + F.cross_entropy(
+                        logits_chunk, targets_flat[i:i+chunk_size],
+                        ignore_index=-1, reduction='sum')
+                return total_loss / n_tokens
+
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -482,8 +507,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+# Model architecture — sized to cross B200 roofline (AI > 562 FLOP/byte)
+ASPECT_RATIO = 96       # model_dim = depth * ASPECT_RATIO (was 64, gives dim=1152 at depth=12)
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
@@ -499,9 +524,10 @@ WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+# Model size — scaled up for B200 (192 GB HBM3e)
+DEPTH = 12              # number of transformer layers (was 8)
+DEVICE_BATCH_SIZE = 64   # per-device batch size — est. ~83 GB at D=12/AR=96, headroom for 192 GB B200
+                         # increase to 128 if peak_vram_mb < 140,000 (target: fill ~180 GB)
 COMPILE_WARMUP_STEPS = 3 # extra warmup for max-autotune kernel benchmarking
 TIMING_WARMUP_STEPS = 10 + COMPILE_WARMUP_STEPS  # total steps before timing starts
 
@@ -608,6 +634,24 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
+# FP8 training: 2.2x throughput on B200 (10,000 TFLOPS FP8 vs 4,500 BF16)
+# Only for Blackwell (SM100+) where FP8 tensor cores are mature
+USE_FP8 = cap[0] >= 10 and config.n_embd >= 1024  # skip for tiny models (FP8 scaling overhead)
+if USE_FP8:
+    from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+    fp8_config = Float8LinearConfig(pad_inner_dim=True)
+    # Skip ve_gate layers (32-wide, too narrow for FP8 benefit)
+    def _fp8_module_filter(mod, fqn):
+        return isinstance(mod, nn.Linear) and "ve_gate" not in fqn
+    convert_to_float8_training(model, config=fp8_config, module_filter_fn=_fp8_module_filter)
+    # Adjust peak FLOPS for FP8 (B200: 10,000 TFLOPS FP8 vs 4,500 BF16)
+    GPU_PEAK_FLOPS = GPU_PEAK_FLOPS * 2.22  # 10000/4500 ≈ 2.22
+    print(f"FP8 training enabled (skipping ve_gate layers, peak adjusted to {GPU_PEAK_FLOPS/1e12:.0f} TFLOPS)")
+else:
+    print(f"FP8 disabled (cap={cap}, n_embd={config.n_embd})")
+
+# Optimizer setup AFTER FP8 conversion — FP8 replaces nn.Linear with Float8Linear,
+# creating new parameter objects. Optimizer must reference the final parameters.
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
@@ -617,7 +661,14 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False, mode="max-autotune-no-cudagraphs")
+# Eagerly build FlexAttention block masks before compile (eliminates graph break in forward)
+if USE_FLEX_ATTENTION:
+    unique_windows = set(model.window_sizes)
+    mask_cache = {ws: _build_flex_block_mask(ws, DEVICE_BATCH_SIZE, config.n_head, MAX_SEQ_LEN)
+                  for ws in unique_windows}
+    model._flex_block_masks = [mask_cache[ws] for ws in model.window_sizes]
+
+model = torch.compile(model, dynamic=False, mode="max-autotune", fullgraph=True)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
