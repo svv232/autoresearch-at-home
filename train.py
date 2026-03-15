@@ -460,7 +460,64 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+def get_gpu_peak_flops():
+    """Detect GPU and return peak bf16 TFLOPS (without sparsity) for MFU calculation."""
+    gpu_name = torch.cuda.get_device_name()
+    # Peak bf16 tensor core FLOPS (without sparsity) for known GPUs.
+    # More specific substrings must come before less specific ones.
+    known_gpus = [
+        # Blackwell data center
+        ("B200",           4500.0e12),
+        # Hopper data center
+        ("H200",            989.5e12),
+        ("H100 PCIe",       756.0e12),
+        ("H100 NVL",        835.0e12),
+        ("H100",            989.5e12),
+        # Ampere data center
+        ("A100",            312.0e12),
+        ("A10G",            125.0e12),
+        ("A10",             125.0e12),
+        # Ada Lovelace data center
+        ("L40S",            362.0e12),
+        ("L40",             181.0e12),
+        ("L4",              121.0e12),
+        # Volta
+        ("V100",            125.0e12),
+        # RTX 50 series (Blackwell)
+        ("RTX 5090",        419.0e12),
+        ("RTX 5080",        225.0e12),
+        ("5070 Ti",         176.0e12),
+        ("RTX 5070",        124.0e12),
+        # RTX 40 series (Ada Lovelace)
+        ("RTX 4090",        330.3e12),
+        ("4080 SUPER",      209.0e12),
+        ("RTX 4080",        195.0e12),
+        ("4070 Ti SUPER",   176.0e12),
+        ("4070 Ti",         160.0e12),
+        ("4070 SUPER",      142.0e12),
+        ("RTX 4070",        117.0e12),
+        # RTX 30 series (Ampere)
+        ("3090 Ti",         160.0e12),
+        ("RTX 3090",        142.0e12),
+        ("3080 Ti",         136.0e12),
+        ("RTX 3080",        119.0e12),
+    ]
+    for pattern, flops in known_gpus:
+        if pattern in gpu_name:
+            print(f"GPU: {gpu_name} ({flops/1e12:.1f} TFLOPS bf16 peak)")
+            return flops
+    # Fallback: rough estimate from compute capability and SM count
+    props = torch.cuda.get_device_properties(0)
+    num_sms = props.multi_processor_count
+    cap = torch.cuda.get_device_capability()
+    tflops_per_sm = {7: 1.6, 8: 2.2, 9: 7.5}.get(cap[0], 2.5)
+    estimated_flops = num_sms * tflops_per_sm * 1e12
+    print(f"WARNING: Unknown GPU '{gpu_name}' (CC {cap[0]}.{cap[1]}, {num_sms} SMs)")
+    print(f"  Estimated {estimated_flops/1e12:.1f} TFLOPS bf16 peak — MFU% will be approximate.")
+    print(f"  Add your GPU to get_gpu_peak_flops() for accurate MFU reporting.")
+    return estimated_flops
+
+GPU_PEAK_FLOPS = get_gpu_peak_flops()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -584,7 +641,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / GPU_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -615,7 +672,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / GPU_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
