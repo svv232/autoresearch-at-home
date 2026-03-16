@@ -515,6 +515,7 @@ elif device_type == "cpu":
     autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
 else:
     autocast_ctx = contextlib.nullcontext()
+eval_batch_size = DEVICE_BATCH_SIZE if device_type != "mps" else min(DEVICE_BATCH_SIZE * 2, 32)
 H100_BF16_PEAK_FLOPS = 989.5e12
 
 tokenizer = Tokenizer.from_directory()
@@ -568,6 +569,7 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
+print(f"Eval batch size: {eval_batch_size}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -673,7 +675,7 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    val_bpb = evaluate_bpb(model, tokenizer, eval_batch_size)
 
 # Final summary
 t_end = time.time()
